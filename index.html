@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>長按時間控制煙花速度與密度</title>
+    <title>長按時間控制煙花速度與加速度</title>
     <script src="https://cdn.jsdelivr.net/npm/p5@1.9.3/lib/p5.js"></script>
     <style>
         /* 將背景顏色設為黑色，並使用低透明度背景實現軌跡拖尾 (讓上一次煙花緩慢消失) */
@@ -20,21 +20,23 @@
 </head>
 <body>
 <script>
-// --- 核心常數調整 ---
-const BASE_PARTICLE_COUNT_MAX = 20; // 快速點擊時的最大粒子數量 (高密度)
-const BASE_PARTICLE_COUNT_MIN = 6;  // 長按時的最小粒子數量 (低密度)
-const SYMMETRY = 12;               // 每個粒子的對稱線條數量 (保持不變以維持爆發形狀)
+// --- 核心常數調整 (為提高效能而減少數量) ---
+const BASE_PARTICLE_COUNT_MAX = 12; // 快速點擊時的最大粒子數量 (高密度)
+const BASE_PARTICLE_COUNT_MIN = 4;  // 長按時的最小粒子數量 (低密度)
+const SYMMETRY = 8;                 // 每個粒子的對稱線條數量
 const FIXED_BLOOM_SPEED = 0.5;
 const FIXED_BLOOM_RATIO = 0.5;  
 
-// --- 速度控制參數 ---
+// --- 運算調整：減少每條線的細分數以提高效能 ---
+const GRADIENT_SEGMENTS = 20; // 繪製漸變的線段數量
+
+// --- 速度控制參數 (長按時間) ---
 let mouseStartTime = 0;
 let fireworkSpeedFactor = 1.0; 
 const MIN_DURATION = 50;  
 const MAX_DURATION = 2000; 
 const MIN_SPEED = 0.15; // 對應長按 (最慢速)
 const MAX_SPEED = 1.0;  // 對應短按 (最快速)
-
 
 // --- 色彩常數 (HSB 色相值) ---
 const WARM_COLORS = [50, 60, 35, 350, 320, 310]; // 紅、橙、黃、粉
@@ -51,8 +53,8 @@ const STYLE_CONFIGS = [
 ];
 
 // --- 全局變數 ---
-let baseLoc = [];       // 最大數量的基礎位置
-let baseVel = [];       // 最大數量的基礎速度
+let baseLoc = [];       
+let baseVel = [];       
 let fireworks = [];     
 let auroraHue = 0;      
 let currentStyleIndex = 0; 
@@ -69,7 +71,8 @@ function setup() {
     // 初始化最大數量的基礎粒子位置和速度
     for (let i = 0; i < BASE_PARTICLE_COUNT_MAX; i++) {
       baseLoc[i] = createVector(random(-50, 50), random(-50, 50));
-      baseVel[i] = p5.Vector.random2D().mult(random(2, 7));
+      // 擴大初始速度的隨機範圍，確保單次爆發內就有明顯的速度差異 (3, 10)
+      baseVel[i] = p5.Vector.random2D().mult(random(3, 10));
     }
 }
 
@@ -83,10 +86,11 @@ function mouseReleased() {
     if (mouseX >= 0 && mouseX <= width && mouseY >= 0 && mouseY <= height && mouseButton === LEFT && mouseStartTime > 0) {
         const pressDuration = millis() - mouseStartTime;
         
-        // 1. 速度控制: 越久 -> 越慢 (低因子)
+        // 1. 速度控制 (與pressDuration成反比)
+        // 短按 Factor 接近 1.0 (快)，長按 Factor 接近 0.15 (慢)
         fireworkSpeedFactor = map(pressDuration, MIN_DURATION, MAX_DURATION, MAX_SPEED, MIN_SPEED, true);
         
-        // 2. 密度控制: 越久 -> 粒子越少 (低密度)
+        // 2. 密度控制 (與pressDuration成反比)
         const fireworkParticleCount = floor(map(
             pressDuration, 
             MIN_DURATION, MAX_DURATION, 
@@ -108,7 +112,7 @@ function mouseReleased() {
 function draw() {
     
     // 根據當前速度因子計算動態的背景淡出透明度
-    // 低 SpeedFactor (慢速) -> 低 Alpha (長軌跡，消失慢)
+    // 低 SpeedFactor (慢速/長按) -> 低 Alpha (長軌跡，消失慢)
     const dynamicFadeAlpha = map(fireworkSpeedFactor, MIN_SPEED, MAX_SPEED, 8, 30);
     
     // 使用動態低透明度黑色背景，實現拖尾軌跡效果 (保留上一次煙花)
@@ -119,7 +123,6 @@ function draw() {
     for (let i = fireworks.length - 1; i >= 0; i--) {
         const isFinished = fireworks[i].updateAndDisplay(auroraHue);
         
-        // 如果 Firework 已經結束 (所有粒子都消失)，則將其從數組中移除
         if (isFinished) {
             fireworks.splice(i, 1);
         }
@@ -135,13 +138,13 @@ class Firework {
         
         this.config = STYLE_CONFIGS[styleIndex]; 
         this.speedFactor = speedFactor; 
-        this.particleCount = particleCount; // 儲存動態粒子數量
+        this.particleCount = particleCount; 
         
         this.spawnWaves(); 
     }
     
     /**
-     * 根據風格配置，生成 1 個 (白色) 或 3-4 個 (非白色) Wave 實例。
+     * 根據風格配置，生成 Waves 實例。
      */
     spawnWaves() {
         if (!this.isSpawning) return;
@@ -156,7 +159,7 @@ class Firework {
             numWaves = 1;
         } else {
             colorPool = useWarm ? WARM_COLORS : COOL_COLORS;
-            numWaves = floor(random(3, 5)); // 3 或 4 種顏色
+            numWaves = floor(random(3, 5)); 
             numWaves = min(numWaves, colorPool.length); 
         }
 
@@ -183,8 +186,8 @@ class Firework {
                 isPale, 
                 isWhite,
                 useWarm,
-                this.speedFactor,
-                this.particleCount // 傳遞動態粒子數量
+                this.speedFactor, // 傳遞速度因子
+                this.particleCount
             ));
         }
         
@@ -226,14 +229,24 @@ class Wave {
         this.isWhite = isWhite; 
         this.useWarmColor = useWarm; 
         this.speedMultiplier = map(mouseSpeed, 0, 1, 1.0, 2.5); 
-        this.speedFactor = speedFactor; 
-        this.particleCount = particleCount; // 使用動態粒子數量
+        this.particleCount = particleCount; 
+        this.speedFactor = speedFactor;
+
+        // --- NEW: 計算動態摩擦力/衰減係數 (長按時間控制) ---
+        // 短按 (High speedFactor) -> Friction Low (0.95, 快速衰減/高加速度)
+        // 長按 (Low speedFactor) -> Friction High (0.99, 緩慢衰減/低加速度)
+        this.friction = map(speedFactor, MIN_SPEED, MAX_SPEED, 0.99, 0.95, true); 
         
-        // 僅初始化需要的粒子數量
+        // 初始化需要的粒子數量
         for (let i = 0; i < this.particleCount; i++) {
-            // 從 baseLoc/baseVel 中複製，但只循環到 particleCount
             this.positions[i] = baseLoc[i].copy(); 
-            this.velocities[i] = p5.Vector.random2D().mult(random(3, 8) * this.speedMultiplier * this.speedFactor);
+            
+            // *** 引入更廣的初始速度差異 (Speed Variation) ***
+            // 讓同一個 Wave 內的粒子有快有慢
+            let baseVelMag = random(3, 10); // 擴大基礎速度範圍
+            
+            // 初始速度仍受 speedFactor 和 baseVelMag 影響
+            this.velocities[i] = p5.Vector.random2D().mult(baseVelMag * this.speedMultiplier * this.speedFactor);
         }
     }
 
@@ -255,8 +268,9 @@ class Wave {
             
             let speedBoostFactor = map(noiseFactor, 0, 1, 0.9, 1.1); 
             
-            // 2. 粒子速度
-            this.velocities[i].mult(speedBoostFactor * speedFactor); 
+            // 2. 粒子速度 (加速度/衰減)
+            // 將速度乘以動態摩擦係數，實現短按快速衰減，長按緩慢衰減
+            this.velocities[i].mult(speedBoostFactor * this.friction); 
             this.velocities[i].rotate(random(-0.02, 0.02) * speedFactor);
 
             this.positions[i].add(this.velocities[i]);
@@ -303,12 +317,22 @@ class Wave {
                         let dynamicLengthMultiplier = map(FIXED_BLOOM_SPEED, 0, 1, 1.5, 5);
                         let effectiveSpeedMultiplier = lerp(this.lineLengthMultiplier, dynamicLengthMultiplier, 0.2); 
                         let distanceLengthFactor = map(d, 0, edge, 1.0, 2.5); 
+                        
                         let combinedScaleFactor = effectiveSpeedMultiplier * distanceLengthFactor; 
+                        
+                        // *** NEW: 引入每條線的長短變化 (Line Length Variation) ***
+                        // 使用 Noise 讓每條線的長度有隨機差異
+                        let lengthNoise = noise(i * 0.2, n * 0.1, frameCount * 0.02);
+                        // 將 noise 映射到 0.5x 到 1.5x 的變動範圍
+                        let lengthVariationFactor = map(lengthNoise, 0, 1, 0.5, 1.5); 
+                        
+                        let lengthScaleFactor = combinedScaleFactor * lengthVariationFactor; // 應用變動
+
                         let lineDirNormalized = lineDir.copy().normalize();
                         let originalLength = lineDir.mag();
                         
-                        // 3. 軌跡長度/線段延伸: 速度因子越低 (長按)，軌跡越短
-                        let extensionLength = originalLength * (combinedScaleFactor - 1) * speedFactor * 2; 
+                        // 3. 軌跡長度/線段延伸 - 使用帶有隨機變化的長度因子
+                        let extensionLength = originalLength * (lengthScaleFactor - 1) * speedFactor * 2; 
                         let extendedEnd = p5.Vector.add(this.positions[i], lineDirNormalized.mult(extensionLength));
                         
                         let startHue = this.color;
@@ -318,7 +342,7 @@ class Wave {
                         endHue = (endHue + sin(frameCount * 0.02 + i * 0.1) * 20) % 360;
                         if (endHue < 0) endHue += 360;
                         
-                        // 處理筆觸粗細 (不變)
+                        // 處理筆觸粗細
                         let isBright = ((n % 2 === 0) !== (i % 2 === 0));
                         let baseStrokeWeight = map(d, 0, edge, 0.2, 4.0); 
                         let symmetryStrokeVariation = sin((TWO_PI / SYMMETRY) * n) * 1.8; 
@@ -333,7 +357,7 @@ class Wave {
                         if(this.isWhite) strokeW *= 1.1; 
                         strokeW = constrain(strokeW, 0.1, 7.0); 
                         
-                        // 處理透明度 (不變)
+                        // 處理透明度
                         let baseAlpha = map(d, 0, edge, 100, 0) * map(this.radius, 0, edge, 0.3, 1);
                         let speedAlpha = map(FIXED_BLOOM_SPEED, 0, 1, 1, 1.2);
                         let alpha = constrain(baseAlpha * speedAlpha, 0, 100);
@@ -346,9 +370,9 @@ class Wave {
         }
     }
 
-    // 繪製帶有色相、亮度漸變的線段 (邏輯不變)
+    // 繪製帶有色相、亮度漸變的線段
     drawGradientLine(start, end, startHue, endHue, saturation, isBright, alpha, strokeW, edge, d) {
-        let segments = 30; 
+        let segments = GRADIENT_SEGMENTS; 
         let lineVec = p5.Vector.sub(end, start);
         let lineLength = lineVec.mag();
         
