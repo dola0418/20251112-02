@@ -3,64 +3,199 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>長按時間控制煙花速度與加速度</title>
+    <title>MediaPipe 臉部地標控制煙花</title>
+    <!-- 載入 p5.js 函式庫 -->
     <script src="https://cdn.jsdelivr.net/npm/p5@1.9.3/lib/p5.js"></script>
     <style>
-        /* 將背景顏色設為黑色，並使用低透明度背景實現軌跡拖尾 (讓上一次煙花緩慢消失) */
         body { 
             margin: 0; 
             overflow: hidden; 
             background-color: #000; 
             user-select: none;
+            font-family: 'Inter', sans-serif;
         }
         canvas { 
             display: block; 
+            z-index: 1;
+        }
+        #video {
+            position: absolute;
+            opacity: 0; /* 隱藏影片元素，只在 p5.js 中使用其串流 */
         }
     </style>
 </head>
 <body>
-<script>
-// --- 核心常數調整 (為提高效能而減少數量) ---
-const BASE_PARTICLE_COUNT_MAX = 12; // 快速點擊時的最大粒子數量 (高密度)
-const BASE_PARTICLE_COUNT_MIN = 4;  // 長按時的最小粒子數量 (低密度)
-const SYMMETRY = 8;                 // 每個粒子的對稱線條數量
+    <video id="video" autoplay playsinline></video>
+
+<script type="module">
+// --- MediaPipe 模組導入 (已修正: 使用 import 語法來正確定義類別) ---
+import { 
+    FilesetResolver, 
+    FaceLandmarker 
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.js";
+
+// --- MediaPipe 全域變數 ---
+let faceLandmarker;
+let video;
+let lastVideoTime = -1;
+let mouthIsDown = false; // 模擬滑鼠按壓狀態
+
+// --- 嘴部偵測閾值 (標準化距離) ---
+// 垂直距離 (13 - 14) / 臉部寬度 (10 - 333)
+const MOUTH_OPEN_THRESHOLD = 0.08; // 嘴巴張開的閾值 (例如：O形)
+const MOUTH_CLOSE_THRESHOLD = 0.03; // 嘴巴閉合的閾值 (例如：_形)
+
+// --- 煙花常數 (與原程式碼相同) ---
+const BASE_PARTICLE_COUNT_MAX = 12; 
+const BASE_PARTICLE_COUNT_MIN = 4;  
+const SYMMETRY = 8;                 
 const FIXED_BLOOM_SPEED = 0.5;
 const FIXED_BLOOM_RATIO = 0.5;  
-
-// --- 運算調整：減少每條線的細分數以提高效能 ---
-const GRADIENT_SEGMENTS = 20; // 繪製漸變的線段數量
-
-// --- 速度控制參數 (長按時間) ---
-let mouseStartTime = 0;
-let fireworkSpeedFactor = 1.0; 
+const GRADIENT_SEGMENTS = 20; 
 const MIN_DURATION = 50;  
 const MAX_DURATION = 2000; 
-const MIN_SPEED = 0.15; // 對應長按 (最慢速)
-const MAX_SPEED = 1.0;  // 對應短按 (最快速)
-
-// --- 色彩常數 (HSB 色相值) ---
-const WARM_COLORS = [50, 60, 35, 350, 320, 310]; // 紅、橙、黃、粉
-const COOL_COLORS = [130, 165, 185, 195, 210, 280]; // 綠、青、藍、紫
-
-// --- 風格配置序列 (6 步循環) ---
+const MIN_SPEED = 0.15; 
+const MAX_SPEED = 1.0;  
+const WARM_COLORS = [50, 60, 35, 350, 320, 310]; 
+const COOL_COLORS = [130, 165, 185, 195, 210, 280]; 
 const STYLE_CONFIGS = [
-    { useWarm: true, isPale: false, isWhite: false }, // 鮮豔暖 -> 多色
-    { useWarm: false, isPale: true, isWhite: false }, // 淺冷色 -> 多色
-    { useWarm: true, isPale: false, isWhite: true },  // 白色 -> 單色
-    { useWarm: false, isPale: false, isWhite: false },// 鮮豔冷 -> 多色
-    { useWarm: true, isPale: true, isWhite: false },  // 淺暖色 -> 多色
-    { useWarm: false, isPale: false, isWhite: true }, // 白色 -> 單色
+    { useWarm: true, isPale: false, isWhite: false }, 
+    { useWarm: false, isPale: true, isWhite: false }, 
+    { useWarm: true, isPale: false, isWhite: true },  
+    { useWarm: false, isPale: false, isWhite: false },
+    { useWarm: true, isPale: true, isWhite: false },  
+    { useWarm: false, isPale: false, isWhite: true }, 
 ];
 
-// --- 全局變數 ---
+// --- 煙花全域變數 ---
 let baseLoc = [];       
 let baseVel = [];       
 let fireworks = [];     
 let auroraHue = 0;      
 let currentStyleIndex = 0; 
+let mouseStartTime = 0; // 現在代表嘴巴張開的時間
 
 
-// --- p5.js 核心函式 ---
+// --- A. MediaPipe 初始化 ---
+
+/**
+ * 初始化 MediaPipe FaceLandmarker
+ */
+async function createFaceLandmarker() {
+    console.log("正在載入 MediaPipe 模型...");
+    const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+    );
+    
+    faceLandmarker = await FaceLandmarker.create(vision, {
+        baseOptions: {
+            modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker_v2_with_blendshapes/float16/1/face_landmarker_v2_with_blendshapes.task`,
+            delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        outputFaceBlendshapes: true,
+        numFaces: 1
+    });
+
+    console.log("模型載入成功! 正在啟動攝像頭...");
+}
+
+/**
+ * 啟動攝像頭並將串流設定給 video 元素
+ */
+function startWebcam() {
+    video = document.getElementById('video');
+    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        // 瀏覽器將在這裡彈出請求攝像頭權限的視窗
+        navigator.mediaDevices.getUserMedia({ video: true })
+            .then(function(stream) {
+                video.srcObject = stream;
+                video.addEventListener('loadeddata', () => {
+                    console.log("攝像頭就緒! 指示: 張開嘴巴(按壓開始)，閉上嘴巴(按壓結束/發射煙花)。");
+                });
+            })
+            .catch(function(err) {
+                console.error("無法取得攝像頭存取權限:", err);
+                console.error("攝像頭錯誤: 存取被拒絕或發生其他問題。請檢查權限設定。");
+            });
+    }
+}
+
+/**
+ * 計算兩個地標點之間的歐幾里得距離
+ */
+function getDistance(p1, p2, width, height) {
+    // 座標範圍在 [0, 1]，需要乘上實際寬高
+    const x1 = p1.x * width;
+    const y1 = p1.y * height;
+    const x2 = p2.x * width;
+    const y2 = p2.y * height;
+    return dist(x1, y1, x2, y2);
+}
+
+/**
+ * 嘴部動作偵測和煙花觸發的核心邏輯
+ */
+function detectMouthAction() {
+    if (!faceLandmarker || !video || video.readyState !== 4) return;
+
+    // 只有當有新的影片幀時才進行偵測
+    const now = performance.now();
+    if (lastVideoTime !== video.currentTime) {
+        lastVideoTime = video.currentTime;
+        const results = faceLandmarker.detectForVideo(video, now);
+
+        if (results.faceLandmarks && results.faceLandmarks.length > 0) {
+            const landmarks = results.faceLandmarks[0];
+            
+            // 嘴巴垂直距離 (上唇中心 13, 下唇中心 14)
+            const mouthVerticalDist = getDistance(landmarks[13], landmarks[14], width, height);
+            
+            // 臉部水平寬度 (臉頰 10, 333) - 用作標準化參考
+            const faceHorizontalDist = getDistance(landmarks[10], landmarks[333], width, height);
+
+            // 標準化嘴部距離
+            const normalizedMouthDist = mouthVerticalDist / faceHorizontalDist;
+            
+            // 簡化狀態機的 Console 輸出，避免過度刷屏
+            let currentAction = '未動作';
+
+            // --- 觸發狀態機 ---
+            if (!mouthIsDown) {
+                // 狀態 1: 嘴巴閉合 -> 偵測張開 (按壓開始)
+                if (normalizedMouthDist > MOUTH_OPEN_THRESHOLD) {
+                    mouthIsDown = true;
+                    mouseStartTime = millis();
+                    currentAction = '按壓開始 (嘴巴張開)';
+                }
+            } else {
+                // 狀態 2: 嘴巴張開 -> 偵測閉合 (釋放並發射煙花)
+                if (normalizedMouthDist < MOUTH_CLOSE_THRESHOLD) {
+                    
+                    const pressDuration = millis() - mouseStartTime;
+
+                    // 觸發煙花發射
+                    spawnFirework(pressDuration);
+                    
+                    // 重置狀態
+                    mouthIsDown = false;
+                    mouseStartTime = 0;
+                    currentAction = `按壓結束 (煙花釋放!) - 持續時間: ${pressDuration.toFixed(0)}ms`;
+                }
+            }
+
+            // 只在狀態改變時或定期輸出狀態 (為了演示，暫時保留每次輸出)
+            // console.log(`標準化嘴部距離: ${normalizedMouthDist.toFixed(3)} | 狀態: ${currentAction}`);
+            
+        } else {
+            // 沒有偵測到臉部
+            // console.log('未偵測到臉部...');
+        }
+    }
+}
+
+
+// --- B. p5.js 初始化與主迴圈 ---
 
 function setup() {
     createCanvas(windowWidth, windowHeight);
@@ -68,54 +203,53 @@ function setup() {
     background(0, 0, 0); 
     noFill();
     
+    // 載入模型和啟動攝像頭 (使用 IIFE 確保非同步執行)
+    (async () => {
+        await createFaceLandmarker();
+        startWebcam();
+    })();
+
     // 初始化最大數量的基礎粒子位置和速度
     for (let i = 0; i < BASE_PARTICLE_COUNT_MAX; i++) {
       baseLoc[i] = createVector(random(-50, 50), random(-50, 50));
-      // 擴大初始速度的隨機範圍，確保單次爆發內就有明顯的速度差異 (3, 10)
       baseVel[i] = p5.Vector.random2D().mult(random(3, 10));
     }
 }
 
-function mousePressed() {
-    if (mouseX >= 0 && mouseX <= width && mouseY >= 0 && mouseY <= height && mouseButton === LEFT) {
-        mouseStartTime = millis(); 
-    }
+function spawnFirework(pressDuration) {
+    if (pressDuration <= 0) return;
+
+    // 1. 速度控制 (與pressDuration成反比)
+    const fireworkSpeedFactor = map(pressDuration, MIN_DURATION, MAX_DURATION, MAX_SPEED, MIN_SPEED, true);
+    
+    // 2. 密度控制 (與pressDuration成反比)
+    const fireworkParticleCount = floor(map(
+        pressDuration, 
+        MIN_DURATION, MAX_DURATION, 
+        BASE_PARTICLE_COUNT_MAX, BASE_PARTICLE_COUNT_MIN, 
+        true
+    ));
+
+    // 發射位置：簡單地設在畫布中心下方，避免與臉部偵測重疊
+    const launchX = width / 2;
+    const launchY = height * 0.75; 
+
+    // 創建 Firework，傳遞速度因子和動態粒子數量
+    fireworks.push(new Firework(launchX, launchY, currentStyleIndex, fireworkSpeedFactor, fireworkParticleCount));
+    
+    // 循環風格索引
+    currentStyleIndex = (currentStyleIndex + 1) % STYLE_CONFIGS.length;
 }
-
-function mouseReleased() {
-    if (mouseX >= 0 && mouseX <= width && mouseY >= 0 && mouseY <= height && mouseButton === LEFT && mouseStartTime > 0) {
-        const pressDuration = millis() - mouseStartTime;
-        
-        // 1. 速度控制 (與pressDuration成反比)
-        // 短按 Factor 接近 1.0 (快)，長按 Factor 接近 0.15 (慢)
-        fireworkSpeedFactor = map(pressDuration, MIN_DURATION, MAX_DURATION, MAX_SPEED, MIN_SPEED, true);
-        
-        // 2. 密度控制 (與pressDuration成反比)
-        const fireworkParticleCount = floor(map(
-            pressDuration, 
-            MIN_DURATION, MAX_DURATION, 
-            BASE_PARTICLE_COUNT_MAX, BASE_PARTICLE_COUNT_MIN, 
-            true
-        ));
-
-        // 創建 Firework，傳遞速度因子和動態粒子數量
-        fireworks.push(new Firework(mouseX, mouseY, currentStyleIndex, fireworkSpeedFactor, fireworkParticleCount));
-        
-        // 循環風格索引
-        currentStyleIndex = (currentStyleIndex + 1) % STYLE_CONFIGS.length;
-
-        mouseStartTime = 0; 
-    }
-}
-
 
 function draw() {
+    // 執行 MediaPipe 偵測邏輯
+    detectMouthAction();
+
+    // 根據當前模擬的速度因子計算動態的背景淡出透明度
+    let currentSpeedFactor = (fireworks.length > 0) ? fireworks[fireworks.length - 1].speedFactor : MAX_SPEED;
+    const dynamicFadeAlpha = map(currentSpeedFactor, MIN_SPEED, MAX_SPEED, 8, 30);
     
-    // 根據當前速度因子計算動態的背景淡出透明度
-    // 低 SpeedFactor (慢速/長按) -> 低 Alpha (長軌跡，消失慢)
-    const dynamicFadeAlpha = map(fireworkSpeedFactor, MIN_SPEED, MAX_SPEED, 8, 30);
-    
-    // 使用動態低透明度黑色背景，實現拖尾軌跡效果 (保留上一次煙花)
+    // 使用動態低透明度黑色背景，實現拖尾軌跡效果
     background(0, 0, 0, dynamicFadeAlpha); 
 
     auroraHue = (auroraHue + 0.5) % 360;
@@ -129,7 +263,15 @@ function draw() {
     }
 }
 
-// --- Firework 類：管理單個點擊的單次爆發效果 ---
+// 視窗尺寸改變時調整畫布大小
+function windowResized() {
+    resizeCanvas(windowWidth, windowHeight);
+    background(0, 0, 0); 
+}
+
+
+// --- C. 煙花類別 (與原程式碼相同) ---
+
 class Firework {
     constructor(x, y, styleIndex, speedFactor, particleCount) {
         this.center = createVector(x, y);
@@ -143,9 +285,6 @@ class Firework {
         this.spawnWaves(); 
     }
     
-    /**
-     * 根據風格配置，生成 Waves 實例。
-     */
     spawnWaves() {
         if (!this.isSpawning) return;
 
@@ -163,7 +302,6 @@ class Firework {
             numWaves = min(numWaves, colorPool.length); 
         }
 
-        // 隨機選擇不重複的顏色
         let selectedHues = [];
         let availableHues = [...colorPool];
 
@@ -173,7 +311,6 @@ class Firework {
             selectedHues.push(baseHue);
         }
 
-        // 創建 Waves
         for (const baseHue of selectedHues) {
             let hueVariation = sin(auroraHue * 0.1) * 10 + cos(auroraHue * 0.15) * 6;
             let hue = (baseHue + hueVariation) % 360;
@@ -186,7 +323,7 @@ class Firework {
                 isPale, 
                 isWhite,
                 useWarm,
-                this.speedFactor, // 傳遞速度因子
+                this.speedFactor, 
                 this.particleCount
             ));
         }
@@ -194,7 +331,6 @@ class Firework {
         this.isSpawning = false;
     }
     
-    // 更新並繪製 Wave
     updateAndDisplay(auroraHue) {
         push();
         translate(this.center.x, this.center.y);
@@ -214,7 +350,6 @@ class Firework {
     }
 }
 
-// --- Wave 類：單個 Firework 中心放射出的一圈粒子/光環 ---
 class Wave {
     constructor(col, mouseRatio, mouseSpeed, isPale, isWhite, useWarm, speedFactor, particleCount) { 
         this.radius = 0;
@@ -232,30 +367,20 @@ class Wave {
         this.particleCount = particleCount; 
         this.speedFactor = speedFactor;
 
-        // --- NEW: 計算動態摩擦力/衰減係數 (長按時間控制) ---
-        // 短按 (High speedFactor) -> Friction Low (0.95, 快速衰減/高加速度)
-        // 長按 (Low speedFactor) -> Friction High (0.99, 緩慢衰減/低加速度)
+        // NEW: 計算動態摩擦力/衰減係數 (嘴巴張開/閉合時間控制)
         this.friction = map(speedFactor, MIN_SPEED, MAX_SPEED, 0.99, 0.95, true); 
         
-        // 初始化需要的粒子數量
         for (let i = 0; i < this.particleCount; i++) {
             this.positions[i] = baseLoc[i].copy(); 
-            
-            // *** 引入更廣的初始速度差異 (Speed Variation) ***
-            // 讓同一個 Wave 內的粒子有快有慢
-            let baseVelMag = random(3, 10); // 擴大基礎速度範圍
-            
-            // 初始速度仍受 speedFactor 和 baseVelMag 影響
+            let baseVelMag = random(3, 10); 
             this.velocities[i] = p5.Vector.random2D().mult(baseVelMag * this.speedMultiplier * this.speedFactor);
         }
     }
 
     updateAndDisplay(auroraHue, speedFactor) {
-        // 1. 半徑增長 (控制爆發和擴散速度)
         this.radius += (10 + FIXED_BLOOM_SPEED * 20) * speedFactor; 
         const edge = max(width, height) * 0.75; 
 
-        // 循環使用動態粒子數量
         for (let i = 0; i < this.particleCount; i++) {
             let prev = this.positions[i].copy();
             let d = this.positions[i].mag(); 
@@ -268,8 +393,6 @@ class Wave {
             
             let speedBoostFactor = map(noiseFactor, 0, 1, 0.9, 1.1); 
             
-            // 2. 粒子速度 (加速度/衰減)
-            // 將速度乘以動態摩擦係數，實現短按快速衰減，長按緩慢衰減
             this.velocities[i].mult(speedBoostFactor * this.friction); 
             this.velocities[i].rotate(random(-0.02, 0.02) * speedFactor);
 
@@ -282,13 +405,11 @@ class Wave {
                 continue;
             }
 
-            // 繪製邏輯
             if (d < this.radius) {
                 
                 let baseSaturation;
                 let minSat, maxSat;
 
-                // 飽和度邏輯
                 if (this.isWhite) {
                     baseSaturation = map(d, 0, edge, 5, 0); 
                     minSat = 0;
@@ -297,7 +418,7 @@ class Wave {
                     baseSaturation = map(d, 0, edge, 40, 10); 
                     minSat = 10; 
                     maxSat = 55;
-                } else { // 鮮豔
+                } else { 
                     baseSaturation = map(d, 0, edge, 90, 30);
                     minSat = 30; 
                     maxSat = 100;
@@ -320,18 +441,14 @@ class Wave {
                         
                         let combinedScaleFactor = effectiveSpeedMultiplier * distanceLengthFactor; 
                         
-                        // *** NEW: 引入每條線的長短變化 (Line Length Variation) ***
-                        // 使用 Noise 讓每條線的長度有隨機差異
                         let lengthNoise = noise(i * 0.2, n * 0.1, frameCount * 0.02);
-                        // 將 noise 映射到 0.5x 到 1.5x 的變動範圍
                         let lengthVariationFactor = map(lengthNoise, 0, 1, 0.5, 1.5); 
                         
-                        let lengthScaleFactor = combinedScaleFactor * lengthVariationFactor; // 應用變動
+                        let lengthScaleFactor = combinedScaleFactor * lengthVariationFactor; 
 
                         let lineDirNormalized = lineDir.copy().normalize();
                         let originalLength = lineDir.mag();
                         
-                        // 3. 軌跡長度/線段延伸 - 使用帶有隨機變化的長度因子
                         let extensionLength = originalLength * (lengthScaleFactor - 1) * speedFactor * 2; 
                         let extendedEnd = p5.Vector.add(this.positions[i], lineDirNormalized.mult(extensionLength));
                         
@@ -342,124 +459,45 @@ class Wave {
                         endHue = (endHue + sin(frameCount * 0.02 + i * 0.1) * 20) % 360;
                         if (endHue < 0) endHue += 360;
                         
-                        // 處理筆觸粗細
                         let isBright = ((n % 2 === 0) !== (i % 2 === 0));
                         let baseStrokeWeight = map(d, 0, edge, 0.2, 4.0); 
                         let symmetryStrokeVariation = sin((TWO_PI / SYMMETRY) * n) * 1.8; 
                         let positionStrokeVariation = sin(i * 0.15 + frameCount * 0.03) * 1.5; 
                         let speedStrokeBoost = map(FIXED_BLOOM_SPEED, 0, 1, 0, 2.0); 
                         let timeStrokeVariation = sin(frameCount * 0.05 + n * 0.5) * 1.2; 
-                        let particleThicknessNoise = noise(i * 0.5, frameCount * 0.05) * 0.5;
+                        let particleThicknessNoise = noise(i * 0.05, frameCount * 0.01) * 2.5;
+
+                        let strokeW = baseStrokeWeight + symmetryStrokeVariation + positionStrokeVariation + speedStrokeBoost + timeStrokeVariation + particleThicknessNoise;
+                        strokeW = constrain(strokeW, 0.5, 5);
                         
-                        let strokeW = baseStrokeWeight + symmetryStrokeVariation + positionStrokeVariation + speedStrokeBoost + timeStrokeVariation;
-                        strokeW *= this.initialStrokeVariation;
-                        strokeW += particleThicknessNoise;
-                        if(this.isWhite) strokeW *= 1.1; 
-                        strokeW = constrain(strokeW, 0.1, 7.0); 
+                        let strokeBrightness = this.isWhite ? 100 : (isBright ? 90 : 70); 
+                        if (this.isPale && !this.isWhite) strokeBrightness = map(saturation, minSat, maxSat, 60, 95); 
                         
-                        // 處理透明度
-                        let baseAlpha = map(d, 0, edge, 100, 0) * map(this.radius, 0, edge, 0.3, 1);
-                        let speedAlpha = map(FIXED_BLOOM_SPEED, 0, 1, 1, 1.2);
-                        let alpha = constrain(baseAlpha * speedAlpha, 0, 100);
-                        
-                        this.drawGradientLine(prev, extendedEnd, startHue, endHue, saturation, isBright, alpha, strokeW, edge, d);
-                    } 
+                        let strokeHue = startHue; 
+                        if (this.isWhite) strokeHue = 0; 
+
+                        // 顏色漸變處理
+                        for (let j = 0; j < GRADIENT_SEGMENTS; j++) {
+                            let tStart = j / GRADIENT_SEGMENTS;
+                            let tEnd = (j + 1) / GRADIENT_SEGMENTS;
+                            
+                            let p1 = p5.Vector.lerp(this.positions[i], extendedEnd, tStart);
+                            let p2 = p5.Vector.lerp(this.positions[i], extendedEnd, tEnd);
+                            
+                            let alpha = map(p1.dist(this.positions[i]), 0, this.positions[i].dist(extendedEnd), 100, 0);
+                            let alphaNoise = noise(p1.x * 0.005, p1.y * 0.005, frameCount * 0.01);
+                            alpha = constrain(alpha * map(alphaNoise, 0, 1, 0.5, 1.5), 0, 100);
+
+                            stroke(strokeHue, saturation, strokeBrightness, alpha);
+                            strokeWeight(strokeW);
+                            line(p1.x, p1.y, p2.x, p2.y);
+                        }
+                    }
                     pop();
                 }
             }
         }
     }
-
-    // 繪製帶有色相、亮度漸變的線段
-    drawGradientLine(start, end, startHue, endHue, saturation, isBright, alpha, strokeW, edge, d) {
-        let segments = GRADIENT_SEGMENTS; 
-        let lineVec = p5.Vector.sub(end, start);
-        let lineLength = lineVec.mag();
-        
-        if (lineLength === 0) return;
-        
-        let brightBase = this.isWhite ? 100 : (this.isPale ? 98 : 100);
-        let darkBase = this.isWhite ? 90 : (this.isPale ? 60 : 30);
-        let veryDarkBase = this.isWhite ? 80 : (this.isPale ? 40 : 15);
-
-        let brightBrightness = isBright ? brightBase : darkBase;
-        let darkBrightness = isBright ? veryDarkBase : (this.isPale ? 20 : 3); 
-
-        // 亮度動態變化
-        let timeBrightnessVariation1 = sin(frameCount * 0.1 + d * 0.01) * 12;
-        let timeBrightnessVariation2 = cos(frameCount * 0.07 + d * 0.015) * 8;
-        let positionBrightnessVariation = sin(d * 0.05) * 6;
-        
-        brightBrightness += timeBrightnessVariation1 + timeBrightnessVariation2 * 0.5 + positionBrightnessVariation;
-        darkBrightness += timeBrightnessVariation1 * 0.4 + timeBrightnessVariation2 * 0.2 + positionBrightnessVariation * 0.3;
-        
-        brightBrightness = constrain(brightBrightness, this.isWhite ? 85 : (this.isPale ? 50 : 20), 100);
-        darkBrightness = constrain(darkBrightness, 0, this.isWhite ? 95 : (this.isPale ? 70 : 25));
-        
-        for (let mirror = -1; mirror <= 1; mirror += 2) {
-            push();
-            scale(1, mirror);
-            
-            for (let s = 0; s < segments; s++) {
-                let t1 = s / segments; 
-                
-                let segStart = p5.Vector.add(start, p5.Vector.mult(lineVec, t1));
-                let segEnd = p5.Vector.add(start, p5.Vector.mult(lineVec, (s + 1) / segments));
-                
-                // 色相漸變計算
-                let hueDiff = endHue - startHue;
-                if (abs(hueDiff) > 180) {
-                    if (hueDiff > 0) hueDiff -= 360;
-                    else hueDiff += 360;
-                }
-                let tEasedHue = t1 * t1 * (3 - 2 * t1); 
-                let currentHue = startHue + hueDiff * tEasedHue;
-                currentHue += sin(frameCount * 0.03 + t1 * 10) * 5;
-                if (currentHue < 0) currentHue += 360;
-                if (currentHue >= 360) currentHue -= 360;
-                
-                // 亮度漸變計算
-                let tEased = (t1 < 0.5) ? pow(map(t1, 0, 0.5, 0, 1), 1.5) : pow(map(t1, 0.5, 1, 1, 0), 1.5);
-                let baseBrightness = lerp(brightBrightness, darkBrightness, tEased);
-                
-                let segmentBrightnessVariation = sin(t1 * PI * 4 + frameCount * 0.05) * 8;
-                let segmentBrightnessVariation2 = cos(t1 * PI * 6 + frameCount * 0.03) * 5; 
-                let currentBrightness = baseBrightness + segmentBrightnessVariation + segmentBrightnessVariation2;
-                currentBrightness = constrain(currentBrightness, 0, 100);
-                
-                let segAlpha = alpha * (1 - abs(t1 - 0.5) * 0.3); 
-
-                // 筆觸粗細變化
-                let thicknessCurve = pow(t1, 2.0); 
-                let segStrokeW = strokeW * (0.2 + thicknessCurve * 1.5); 
-                segStrokeW += sin(frameCount * 0.06 + t1 * 20) * 0.5; 
-                segStrokeW = constrain(segStrokeW, 0.05, strokeW * 2.0); 
-                
-                // 飽和度變化
-                let lineSaturationFactor = lerp(0.4, 1.0, pow(t1, 1.5)); 
-                let baseSegSaturation = saturation + sin(frameCount * 0.05 + t1 * 15) * 10;
-                let segSaturationVariation = cos(frameCount * 0.07 + t1 * 20) * 6;
-                let segSaturation = (baseSegSaturation + segSaturationVariation) * lineSaturationFactor; 
-                
-                let maxSat_constraint = this.isWhite ? 5 : (this.isPale ? 55 : 100);
-                let minSat_constraint = this.isWhite ? 0 : (this.isPale ? 10 : 30); 
-                segSaturation = constrain(segSaturation, minSat_constraint, maxSat_constraint); 
-                
-                stroke(currentHue, segSaturation, currentBrightness, segAlpha);
-                strokeWeight(segStrokeW);
-                
-                line(segStart.x, segStart.y, segEnd.x, segEnd.y);
-            }
-            
-            pop();
-        }
-    }
-}
-
-// 視窗尺寸改變時調整畫布大小
-function windowResized() {
-    resizeCanvas(windowWidth, windowHeight);
-    background(0, 0, 0); 
 }
 </script>
 </body>
